@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Локальний міст для Raspberry Pi 5: Candle (вбудований PTY) → GRBL + GPIO реле."""
+"""Локальний міст для Raspberry Pi 5: сокет socat → GRBL + GPIO реле."""
 
 import re
 import sys
-import os
-import pty
 import threading
 import time
 import serial
@@ -18,17 +16,15 @@ PIN_M8 = 23             # Додатковий пін M8
 # ==========================================================
 
 BAUD_RATE = 115200
-VIRTUAL_LINK = "/tmp/vport_candle"
-
 COMMENT_RE = re.compile(r"\(.*?\)|;.*")
 RELAY_TOKENS = {"M3", "M03", "M4", "M04", "M5", "M05", "M7", "M07", "M8", "M08", "M9", "M09"}
 GRBL_REALTIME = {0x18, ord("?"), ord("!"), ord("~")}
 
 
 class LocalBridge:
-    def __init__(self, master_fd: int, cnc: serial.Serial) -> None:
-        self.master_fd = master_fd
-        self.cnc = cnc
+    def __init__(self, bridge_port: str, cnc_port: str) -> None:
+        self.bridge_ser = serial.Serial(bridge_port, BAUD_RATE, timeout=0.05)
+        self.cnc_ser = serial.Serial(cnc_port, BAUD_RATE, timeout=0.05)
         self.stop = threading.Event()
         
         self._candle_line = bytearray()
@@ -46,9 +42,9 @@ class LocalBridge:
         self.pending = []
 
     def run(self) -> None:
-        print("Локальний міст запущено з вбудованим PTY.")
+        print("Локальний міст через socat запущено.")
         threads = [
-            threading.Thread(target=self._read_candle, daemon=True),
+            threading.Thread(target=self._read_bridge, daemon=True),
             threading.Thread(target=self._read_cnc, daemon=True),
         ]
         for t in threads:
@@ -70,27 +66,22 @@ class LocalBridge:
                 pass
         lgpio.gpiochip_close(self.h)
         try:
-            os.close(self.master_fd)
+            self.bridge_ser.close()
         except:
             pass
-        self.cnc.close()
-        if os.path.exists(VIRTUAL_LINK):
-            try:
-                os.unlink(VIRTUAL_LINK)
-            except:
-                pass
+        try:
+            self.cnc_ser.close()
+        except:
+            pass
         print("Міст зупинено.")
 
-    def _read_candle(self) -> None:
+    def _read_bridge(self) -> None:
         while not self.stop.is_set():
-            try:
-                data = os.read(self.master_fd, 256)
-            except OSError:
-                break
+            data = self.bridge_ser.read(256)
             if not data:
                 continue
-            self.cnc.write(data)
-            self.cnc.flush()
+            self.cnc_ser.write(data)
+            self.cnc_ser.flush()
             
             for byte in data:
                 if byte in GRBL_REALTIME:
@@ -110,11 +101,12 @@ class LocalBridge:
 
     def _read_cnc(self) -> None:
         while not self.stop.is_set():
-            data = self.cnc.read(256)
+            data = self.cnc_ser.read(256)
             if not data:
                 continue
             try:
-                os.write(self.master_fd, data)
+                self.bridge_ser.write(data)
+                self.bridge_ser.flush()
             except OSError:
                 break
 
@@ -153,21 +145,8 @@ class LocalBridge:
 
 
 if __name__ == "__main__":
-    cnc_port_name = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
+    bridge_port_name = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vport_bridge"
+    cnc_port_name = sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyUSB0"
     
-    # Створюємо віртуальний порт самостійно всередині Python
-    master_fd, slave_fd = pty.openpty()
-    slave_name = os.ttyname(slave_fd)
-    
-    if os.path.exists(VIRTUAL_LINK):
-        os.unlink(VIRTUAL_LINK)
-    os.symlink(slave_name, VIRTUAL_LINK)
-    print(f"Віртуальний порт створено: {VIRTUAL_LINK} -> {slave_name}")
-    
-    cnc_ser = serial.Serial(cnc_port_name, BAUD_RATE, timeout=0.05)
-    bridge = LocalBridge(master_fd, cnc_ser)
-    
-    try:
-        bridge.run()
-    finally:
-        os.close(slave_fd)
+    bridge = LocalBridge(bridge_port_name, cnc_port_name)
+    bridge.run()
