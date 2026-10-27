@@ -3,6 +3,7 @@
 
 import re
 import sys
+import os
 import socket
 import threading
 import time
@@ -26,6 +27,7 @@ GRBL_REALTIME = {0x18, ord("?"), ord("!"), ord("~")}
 
 class TelnetBridge:
     def __init__(self, cnc_port: str) -> None:
+        print(f"Підключення до станка на порту {cnc_port}...")
         self.cnc = serial.Serial(cnc_port, BAUD_RATE, timeout=0.05)
         self.stop = threading.Event()
 
@@ -40,6 +42,7 @@ class TelnetBridge:
             lgpio.gpio_write(self.h, pin, 1)  # HIGH (вимкнено для активного LOW)
 
         self.client_sock = None
+        print("GPIO успішно ініціалізовано.")
 
     def run(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -110,6 +113,7 @@ class TelnetBridge:
         
         for token in tokens:
             if token in RELAY_TOKENS:
+                print(f"Знайдено токен реле в команді: {token} (рядок: {line})")
                 self._handle_relay(token)
 
         self.cnc.write((line + '\n').encode('utf-8'))
@@ -119,28 +123,44 @@ class TelnetBridge:
             if token in ("M3", "M03"):
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 0)  # LOW (увімкнено)
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 1)  # Пряме
+                print("-> Реле шпинделя УВІМКНЕНО (M3)")
             elif token in ("M4", "M04"):
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 0)  # LOW (увімкнено)
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 0)  # Реверс
+                print("-> Реле шпинделя УВІМКНЕНО Реверс (M4)")
             elif token in ("M5", "M05"):
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 1)  # HIGH (вимкнено)
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 1)  # Пряме
+                print("-> Реле шпинделя ВИМКНЕНО (M5)")
             elif token in ("M7", "M07"):
                 lgpio.gpio_write(self.h, PIN_M7, 0)
+                print("-> Пін M7 активовано")
             elif token in ("M8", "M08"):
                 lgpio.gpio_write(self.h, PIN_M8, 0)
+                print("-> Пін M8 активовано")
             elif token in ("M9", "M09"):
                 lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 1)
                 lgpio.gpio_write(self.h, PIN_M7, 1)
                 lgpio.gpio_write(self.h, PIN_M8, 1)
+                print("-> Все охолодження/шпиндель ВИМКНЕНО (M9)")
         except Exception as e:
             print(f"Помилка керування реле ({token}): {e}")
 
 
 if __name__ == "__main__":
     cnc_port_name = '/dev/ttyACM0'
-    bridge = TelnetBridge(cnc_port_name)
+    
+    # Чекаємо появи порту станка при запуску системи (до 20 секунд)
+    print(f"Очікування появи портів станка ({cnc_port_name})...")
+    for _ in range(20):
+        if os.path.exists(cnc_port_name):
+            break
+        time.sleep(1)
+    
     try:
+        bridge = TelnetBridge(cnc_port_name)
         bridge.run()
     except KeyboardInterrupt:
-        print("Зупинка мосту...")
+        print("\nЗупинка мосту...")
+    except Exception as e:
+        print(f"Критична помилка мосту: {e}")
