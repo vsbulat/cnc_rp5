@@ -1,54 +1,146 @@
 #!/usr/bin/env python3
-import serial
-import serial.tools.list_ports
-import time
+"""Telnet/TCP міст для Raspberry Pi 5: UGS (Telnet) → GRBL + GPIO реле."""
+
+import re
 import sys
+import socket
+import threading
+import time
+import serial
+import lgpio
+
+# ================= НАЛАШТУВАННЯ ПІНІВ (BCM) =================
+RELAY_SPINDLE_DIR = 17  # Реверс / полярність (M3 / M4)
+RELAY_SPINDLE_PWR = 27  # Увімкнення шпинделя
+PIN_M7 = 22             # Додатковий пін M7
+PIN_M8 = 23             # Додатковий пін M8
+# ==========================================================
 
 BAUD_RATE = 115200
+TCP_PORT = 2323
 
-def find_cnc_port():
-    print("Шукаємо підключений станок...")
-    ports = serial.tools.list_ports.comports()
-    for port in ports:
-        if 'ACM' in port.device or 'USB' in port.device:
+COMMENT_RE = re.compile(r"\(.*?\)|;.*")
+RELAY_TOKENS = {"M3", "M03", "M4", "M04", "M5", "M05", "M7", "M07", "M8", "M08", "M9", "M09"}
+GRBL_REALTIME = {0x18, ord("?"), ord("!"), ord("~")}
+
+
+class TelnetBridge:
+    def __init__(self, cnc_port: str) -> None:
+        self.cnc = serial.Serial(cnc_port, BAUD_RATE, timeout=0.05)
+        self.stop = threading.Event()
+
+        self._candle_line = bytearray()
+        self._cnc_line = bytearray()
+        self._lock = threading.Lock()
+
+        # Ініціалізація GPIO на Raspberry Pi 5
+        self.h = lgpio.gpiochip_open(0)
+        for pin in (RELAY_SPINDLE_DIR, RELAY_SPINDLE_PWR, PIN_M7, PIN_M8):
+            lgpio.gpio_claim_output(self.h, pin)
+            lgpio.gpio_write(self.h, pin, 1)  # HIGH (вимкнено для активного LOW)
+
+        self.client_sock = None
+
+    def run(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", TCP_PORT))
+        server.listen(1)
+        print(f"Telnet міст запущено і слухає на 127.0.0.1:{TCP_PORT}...")
+
+        cnc_thread = threading.Thread(target=self._read_cnc, daemon=True)
+        cnc_thread.start()
+
+        while not self.stop.is_set():
             try:
-                print(f"Перевіряємо порт: {port.device}...")
-                s = serial.Serial(port.device, BAUD_RATE, timeout=1)
-                time.sleep(2.0) # Очікування перезавантаження контролера
-                s.write(b'\r\n?\r\n')
-                time.sleep(0.5)
-                resp = s.read_all()
-                s.close()
-                # Перевірка наявності стандартного статусу GRBL у відповіді
-                if b'Idle' in resp or b'Run' in resp or b'Alarm' in resp:
-                    print(f"Знайдено станок на порті: {port.device}")
-                    return port.device
-            except Exception:
+                server.settimeout(1.0)
+                client, addr = server.accept()
+                print(f"Клієнт підключився з {addr}")
+                self.client_sock = client
+                self._handle_client(client)
+            except socket.timeout:
                 continue
-    
-    print("Попередження: Автоматичний порт не знайдено, використовуємо за замовчуванням /dev/ttyACM0")
-    return "/dev/ttyACM0"
+            except Exception as e:
+                print(f"Помилка сервера: {e}")
 
-def main():
-    port = find_cnc_port()
-    print(f"Підключення до станка через {port} на швидкості {BAUD_RATE}...")
-    
-    try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
-        time.sleep(2.0)
-        print("Міст успішно запущено. Очікування даних...")
+    def _read_cnc(self) -> None:
+        while not self.stop.is_set():
+            try:
+                data = self.cnc.read(256)
+                if data:
+                    with self._lock:
+                        if self.client_sock:
+                            try:
+                                self.client_sock.sendall(data)
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"Помилка читання з CNC: {e}")
+                time.sleep(0.1)
+
+    def _handle_client(self, client: socket.socket) -> None:
+        client.settimeout(None)
+        while not self.stop.is_set():
+            try:
+                data = client.recv(256)
+                if not data:
+                    break
+                
+                for b in data:
+                    if b in GRBL_REALTIME:
+                        self.cnc.write(bytes([b]))
+                    else:
+                        self._candle_line.append(b)
+                        if b == ord('\n'):
+                            line = self._candle_line.decode('utf-8', errors='ignore').strip()
+                            self._candle_line.clear()
+                            self._process_line(line)
+            except Exception as e:
+                print(f"Помилка клієнта: {e}")
+                break
         
-        while True:
-            if ser.in_waiting > 0:
-                data = ser.read(ser.in_waiting)
-                sys.stdout.buffer.write(data)
-                sys.stdout.flush()
-            time.sleep(0.01)
-            
-    except KeyboardInterrupt:
-        print("\nРоботу мосту зупинено користувачем.")
-    except Exception as e:
-        print(f"Помилка з'єднання: {e}")
+        with self._lock:
+            self.client_sock = None
+        client.close()
+        print("Клієнт відключився")
+
+    def _process_line(self, line: str) -> None:
+        clean_line = COMMENT_RE.sub("", line).upper()
+        tokens = clean_line.split()
+        
+        for token in tokens:
+            if token in RELAY_TOKENS:
+                self._handle_relay(token)
+
+        self.cnc.write((line + '\n').encode('utf-8'))
+
+    def _handle_relay(self, token: str) -> None:
+        try:
+            if token in ("M3", "M03"):
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 0)  # LOW (увімкнено)
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 1)  # Пряме
+            elif token in ("M4", "M04"):
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 0)  # LOW (увімкнено)
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 0)  # Реверс
+            elif token in ("M5", "M05"):
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 1)  # HIGH (вимкнено)
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_DIR, 1)  # Пряме
+            elif token in ("M7", "M07"):
+                lgpio.gpio_write(self.h, PIN_M7, 0)
+            elif token in ("M8", "M08"):
+                lgpio.gpio_write(self.h, PIN_M8, 0)
+            elif token in ("M9", "M09"):
+                lgpio.gpio_write(self.h, RELAY_SPINDLE_PWR, 1)
+                lgpio.gpio_write(self.h, PIN_M7, 1)
+                lgpio.gpio_write(self.h, PIN_M8, 1)
+        except Exception as e:
+            print(f"Помилка керування реле ({token}): {e}")
+
 
 if __name__ == "__main__":
-    main()
+    cnc_port_name = '/dev/ttyACM0'
+    bridge = TelnetBridge(cnc_port_name)
+    try:
+        bridge.run()
+    except KeyboardInterrupt:
+        print("Зупинка мосту...")
